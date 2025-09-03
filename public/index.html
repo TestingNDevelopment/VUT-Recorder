@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>VUT Meeting Recorder</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>VUT Meeting Recorder</h1>
+
+  <!-- ① Auth UI -->
+  <div id="auth-area">
+    <button id="login-btn">Sign in with Google</button>
+    <button id="logout-btn" style="display:none;">Logout</button>
+  </div>
+
+  <!-- ② Recording UI -->
+  <button id="record-btn" disabled>Start Recording</button>
+  <div id="status"></div>
+
+  <script>
+    // --------------------------------------------------------------
+    // 0️⃣ Helper: check auth status by pinging a protected endpoint
+    // --------------------------------------------------------------
+    async function checkAuth() {
+      try {
+        const r = await fetch('/upload-drive', {method:'HEAD'}); // cheap HEAD request
+        return r.ok; // 200 means we have a valid access token cookie
+      } catch (_) { return false; }
+    }
+
+    // --------------------------------------------------------------
+    // 1️⃣ Login / Logout UI
+    // --------------------------------------------------------------
+    const loginBtn = document.getElementById('login-btn');
+    const logoutBtn = document.getElementById('logout-btn');
+
+    loginBtn.onclick = () => { window.location = '/auth/login'; };
+    logoutBtn.onclick = async () => {
+      // clear cookies client‑side (they're HttpOnly, so we just navigate to a server route)
+      await fetch('/auth/logout', {method:'POST'}); // we’ll add a tiny route later
+      location.reload();
+    };
+
+    // Show/hide buttons based on auth state
+    (async () => {
+      const isAuth = await checkAuth();
+      if (isAuth) {
+        loginBtn.style.display = 'none';
+        logoutBtn.style.display = 'inline-block';
+        document.getElementById('record-btn').disabled = false;
+      }
+    })();
+
+    // --------------------------------------------------------------
+    // 2️⃣ UI helpers (status, tooltip)
+    // --------------------------------------------------------------
+    const statusEl = document.getElementById('status');
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = msg;
+      statusEl.style.color = isError ? '#c00' : '#555';
+    }
+    function showPreCaptureTooltip() {
+      const tip = document.createElement('div');
+      tip.className = 'tooltip';
+      tip.textContent = 'When the screen‑share dialog appears, CHECK “Share audio”.';
+      document.body.appendChild(tip);
+      setTimeout(() => tip.remove(), 8000);
+    }
+
+    // --------------------------------------------------------------
+    // 3️⃣ Media capture helpers (same as your original code)
+    // --------------------------------------------------------------
+    function isSupportedBrowser() {
+      return /Chrome|Edg/.test(navigator.userAgent) && !!navigator.mediaDevices?.getDisplayMedia;
+    }
+    async function captureScreen() {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {cursor:"always"},
+        audio: true
+      });
+      if (!stream.getAudioTracks().length) throw new Error('No system audio captured – check “Share audio”.');
+      return stream;
+    }
+    async function captureMic() {
+      return await navigator.mediaDevices.getUserMedia({audio:true});
+    }
+    function mixAudio(screenStream, micStream) {
+      const audioCtx = new AudioContext();
+      const destination = audioCtx.createMediaStreamDestination();
+
+      const sysSource = audioCtx.createMediaStreamSource(screenStream);
+      const delayNode = audioCtx.createDelay(0.5);
+      delayNode.delayTime.value = 0.2; // tweak if needed
+      sysSource.connect(delayNode).connect(destination);
+
+      const micSource = audioCtx.createMediaStreamSource(micStream);
+      micSource.connect(destination);
+      return destination.stream;
+    }
+    function buildCombinedStream(screenStream, mixedAudioStream) {
+      const combined = new MediaStream();
+      const videoTrack = screenStream.getVideoTracks()[0];
+      if (videoTrack) combined.addTrack(videoTrack);
+      const audioTrack = mixedAudioStream.getAudioTracks()[0];
+      if (audioTrack) combined.addTrack(audioTrack);
+      return combined;
+    }
+    function startRecording(combinedStream, onStop) {
+      const recorder = new MediaRecorder(combinedStream, {mimeType:'video/webm; codecs=vp9,opus'});
+      const chunks = [];
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.onstop = () => onStop(new Blob(chunks, {type:recorder.mimeType}));
+      recorder.start();
+      return recorder;
+    }
+
+    // --------------------------------------------------------------
+    // 4️⃣ Upload to Google Drive (resumable, single request)
+    // --------------------------------------------------------------
+    async function uploadToDrive(blob) {
+      setStatus('⏳ Uploading to Drive…');
+      const resp = await fetch('/upload-drive', {
+        method: 'POST',
+        headers: {'Content-Type':'application/octet-stream'},
+        body: blob
+      });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error('Upload failed: ' + txt);
+      }
+      const data = await resp.json();
+      return data;
+    }
+
+    // --------------------------------------------------------------
+    // 5️⃣ Full UI flow
+    // --------------------------------------------------------------
+    const recordBtn = document.getElementById('record-btn');
+    let recorder = null;
+    let stopHandler = null;
+
+    recordBtn.onclick = async () => {
+      if (!isSupportedBrowser()) {
+        setStatus('❌ Only Chrome/Edge (desktop) is supported.', true);
+        return;
+      }
+      try {
+        setStatus('⏳ Preparing…');
+        showPreCaptureTooltip();
+
+        const screenStream = await captureScreen();
+        const micStream = await captureMic();
+        const mixedAudio = mixAudio(screenStream, micStream);
+        const finalStream = buildCombinedStream(screenStream, mixedAudio);
+
+        recorder = startRecording(finalStream, async (blob) => {
+          try {
+            const {fileId, webViewLink} = await uploadToDrive(blob);
+            setStatus('✅ Uploaded to Drive! 🎉');
+            // optional: show a link to the file
+            const a = document.createElement('a');
+            a.href = `https://drive.google.com/file/d/${fileId}/view`;
+            a.textContent = 'Open in Drive';
+            a.target = '_blank';
+            statusEl.appendChild(document.createElement('br'));
+            statusEl.appendChild(a);
+          } catch (e) {
+            console.error(e);
+            setStatus('❌ ' + e.message, true);
+          }
+        });
+
+        setStatus('🔴 Recording… Click “Stop Recording” to finish.');
+        recordBtn.textContent = 'Stop Recording';
+        stopHandler = () => {
+          recorder.stop();
+          recordBtn.textContent = 'Start Recording';
+          recordBtn.onclick = startButtonHandler; // restore
+        };
+        recordBtn.onclick = stopHandler;
+        // auto‑stop after 10 min (optional)
+        setTimeout(() => {
+          if (recorder && recorder.state === 'recording') recorder.stop();
+        }, 10*60*1000);
+      } catch (e) {
+        console.error(e);
+        setStatus('❌ ' + e.message, true);
+      }
+    };
+    const startButtonHandler = recordBtn.onclick; // keep original for restore
+  </script>
+</body>
+</html>
